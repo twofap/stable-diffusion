@@ -19,8 +19,8 @@ import time
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
-from ldm.util import instantiate_from_config
-from optimUtils import split_weighted_subprompts, logger
+from diffusion.util import instantiate_from_config
+from util import split_weighted_subprompts, logger
 from transformers import logging
 logging.set_verbosity_error()
 import mimetypes
@@ -41,8 +41,8 @@ def load_model_from_config(ckpt, verbose=False):
     sd = pl_sd["state_dict"]
     return sd
 
-config = "optimizedSD/v1-inference.yaml"
-ckpt = "models/ldm/stable-diffusion-v1/model.ckpt"
+config = "diffusion/v1-inference.yaml"
+ckpt = "models/diffusion/stable-diffusion-v1/model.ckpt"
 sd = load_model_from_config(f"{ckpt}")
 li, lo = [], []
 for key, v_ in sd.items():

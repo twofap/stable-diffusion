@@ -27,7 +27,7 @@ ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7860
 EXPOSE 7860
 
-RUN ln -s /data /root/stable-diffusion/models/ldm/stable-diffusion-v1 \
+RUN ln -s /data /root/stable-diffusion/models/diffusion/stable-diffusion-v1 \
  && mkdir -p /output /root/stable-diffusion/outputs \
  && ln -s /output /root/stable-diffusion/outputs/txt2img-samples
 
