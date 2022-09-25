@@ -13,7 +13,7 @@ from diffusion.util import (
     normalization,
     timestep_embedding,
 )
-from diffusion.splitAttention import SpatialTransformer
+from diffusion.attention import SpatialTransformer
 
 
 class AttentionPool2d(nn.Module):
