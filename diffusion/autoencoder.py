@@ -2,12 +2,9 @@ import torch
 import pytorch_lightning as pl
 import torch.nn.functional as F
 from contextlib import contextmanager
-
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
-
 from diffusion.model import Encoder, Decoder
 from diffusion.distributions import DiagonalGaussianDistribution
-
 from diffusion.util import instantiate_from_config
 
 

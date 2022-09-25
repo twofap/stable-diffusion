@@ -14,7 +14,7 @@ To reduce the VRAM usage, the following opimizations are used:
 
 <h1 align="center">Installation</h1>
 
-All the modified files are in the [optimizedSD](optimizedSD) folder, so if you have already cloned the original repository you can just download and copy this folder into the original instead of cloning the entire repo. You can also clone this repo and follow the same installation steps as the original (mainly creating the conda environment and placing the weights at the specified location).
+Clone this repo and follow the same installation steps as the original (mainly creating the conda environment and placing the weights at the specified location).
 
 Alternatively, if you prefer to use Docker, you can do the following:
 
@@ -35,7 +35,7 @@ This will launch gradio on port 7860 with txt2img. You can also use `docker comp
 
 - For example, the following command will generate 10 512x512 images:
 
-`python optimizedSD/optimized_img2img.py --prompt "Austrian alps" --init-img ~/sketch-mountains-input.jpg --strength 0.8 --n_iter 2 --n_samples 5 --H 512 --W 512`
+`python scripts/img2img.py --prompt "Austrian alps" --init-img ~/sketch-mountains-input.jpg --strength 0.8 --n_iter 2 --n_samples 5 --H 512 --W 512`
 
 ## txt2img
 
@@ -43,13 +43,13 @@ This will launch gradio on port 7860 with txt2img. You can also use `docker comp
 
 - For example, the following command will generate 10 512x512 images:
 
-`python optimizedSD/optimized_txt2img.py --prompt "Cyberpunk style image of a Tesla car reflection in rain" --H 512 --W 512 --seed 27 --n_iter 2 --n_samples 5 --ddim_steps 50`
+`python scripts/txt2img.py --prompt "Cyberpunk style image of a Tesla car reflection in rain" --H 512 --W 512 --seed 27 --n_iter 2 --n_samples 5 --ddim_steps 50`
 
 ## inpainting
 
 - `inpaint_gradio.py` can fill masked parts of an image based on a given prompt. It can inpaint 512x512 images while using under 2.5GB of VRAM.
 
-- To launch the gradio interface for inpainting, run `python optimizedSD/inpaint_gradio.py`. The mask for the image can be drawn on the selected image using the brush tool.
+- To launch the gradio interface for inpainting, run `python scripts/inpaint_gradio.py`. The mask for the image can be drawn on the selected image using the brush tool.
 
 - The results are not yet perfect but can be improved by using a combination of prompt weighting, prompt engineering and testing out multiple values of the `--strength` argument.
 
@@ -59,7 +59,7 @@ This will launch gradio on port 7860 with txt2img. You can also use `docker comp
 
 - You can also use the built-in gradio interface for `img2img`, `txt2img` & `inpainting` instead of the command line interface. Activate the conda environment and install the latest version of gradio using `pip install gradio`,
 
-- Run img2img using `python optimizedSD/img2img_gradio.py`, txt2img using `python optimizedSD/txt2img_gradio.py` and inpainting using `python optimizedSD/inpaint_gradio.py`.
+- Run img2img using `python scripts/img2img_gradio.py`, txt2img using `python scripts/txt2img_gradio.py` and inpainting using `python scripts/inpaint_gradio.py`.
 
 - img2img_gradio.py has a feature to crop input images. Look for the pen symbol in the image box after selecting the image.
 
