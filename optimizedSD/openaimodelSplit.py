@@ -4,7 +4,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-from ldm.modules.diffusionmodules.util import (
+from ldm.util import (
     checkpoint,
     conv_nd,
     linear,
