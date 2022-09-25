@@ -2,11 +2,9 @@ import gradio as gr
 import numpy as np
 import torch
 from torchvision.utils import make_grid
-from einops import rearrange
 import os, re
 from PIL import Image
 import torch
-import pandas as pd
 import numpy as np
 from random import randint
 from omegaconf import OmegaConf
@@ -18,10 +16,12 @@ from torchvision.utils import make_grid
 import time
 from pytorch_lightning import seed_everything
 from torch import autocast
+from einops import rearrange, repeat
 from contextlib import nullcontext
-from diffusion.util import instantiate_from_config
-from util import split_weighted_subprompts, logger
+from ldm.util import instantiate_from_config
 from transformers import logging
+import pandas as pd
+from optimUtils import split_weighted_subprompts, logger
 logging.set_verbosity_error()
 import mimetypes
 mimetypes.init()
@@ -41,8 +41,26 @@ def load_model_from_config(ckpt, verbose=False):
     sd = pl_sd["state_dict"]
     return sd
 
-config = "diffusion/v1-inference.yaml"
-ckpt = "models/diffusion/stable-diffusion-v1/model.ckpt"
+
+def load_img(image, h0, w0):
+
+    image = image.convert("RGB")
+    w, h = image.size
+    print(f"loaded input image of size ({w}, {h})")
+    if h0 is not None and w0 is not None:
+        h, w = h0, w0
+
+    w, h = map(lambda x: x - x % 64, (w, h))  # resize to integer multiple of 32
+
+    print(f"New image size ({w}, {h})")
+    image = image.resize((w, h), resample=Image.LANCZOS)
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return 2.0 * image - 1.0
+
+config = "optimizedSD/v1-inference.yaml"
+ckpt = "models/ldm/stable-diffusion-v1/model.ckpt"
 sd = load_model_from_config(f"{ckpt}")
 li, lo = [], []
 for key, v_ in sd.items():
@@ -76,9 +94,10 @@ _, _ = modelFS.load_state_dict(sd, strict=False)
 modelFS.eval()
 del sd
 
-
 def generate(
+    image,
     prompt,
+    strength,
     ddim_steps,
     n_iter,
     batch_size,
@@ -93,28 +112,28 @@ def generate(
     img_format,
     turbo,
     full_precision,
-    sampler,
 ):
-
-    C = 4
-    f = 8
-    start_code = None
-    model.unet_bs = unet_bs
-    model.turbo = turbo
-    model.cdevice = device
-    modelCS.cond_stage_model.device = device
 
     if seed == "":
         seed = randint(0, 1000000)
     seed = int(seed)
     seed_everything(seed)
+
     # Logging
-    logger(locals(), "logs/txt2img_gradio_logs.csv")
+    sampler = "ddim"
+    logger(locals(), log_csv = "logs/img2img_gradio_logs.csv")
+
+    init_image = load_img(image, Height, Width).to(device)
+    model.unet_bs = unet_bs
+    model.turbo = turbo
+    model.cdevice = device
+    modelCS.cond_stage_model.device = device
 
     if device != "cpu" and full_precision == False:
         model.half()
-        modelFS.half()
         modelCS.half()
+        modelFS.half()
+        init_image = init_image.half()
 
     tic = time.time()
     os.makedirs(outdir, exist_ok=True)
@@ -122,10 +141,25 @@ def generate(
     sample_path = os.path.join(outpath, "_".join(re.split(":| ", prompt)))[:150]
     os.makedirs(sample_path, exist_ok=True)
     base_count = len(os.listdir(sample_path))
-    
+
     # n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
     assert prompt is not None
     data = [batch_size * [prompt]]
+
+    modelFS.to(device)
+
+    init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
+    init_latent = modelFS.get_first_stage_encoding(modelFS.encode_first_stage(init_image))  # move to latent space
+
+    if device != "cpu":
+        mem = torch.cuda.memory_allocated() / 1e6
+        modelFS.to("cpu")
+        while torch.cuda.memory_allocated() / 1e6 >= mem:
+            time.sleep(1)
+
+    assert 0.0 <= strength <= 1.0, "can only work with strength in [0.0, 1.0]"
+    t_enc = int(strength * ddim_steps)
+    print(f"target t_enc is {t_enc} steps")
 
     if full_precision == False and device != "cpu":
         precision_scope = autocast
@@ -135,7 +169,6 @@ def generate(
     all_samples = []
     seeds = ""
     with torch.no_grad():
-
         all_samples = list()
         for _ in trange(n_iter, desc="Sampling"):
             for prompts in tqdm(data, desc="data"):
@@ -160,25 +193,24 @@ def generate(
                     else:
                         c = modelCS.get_learned_conditioning(prompts)
 
-                    shape = [batch_size, C, Height // f, Width // f]
-
                     if device != "cpu":
                         mem = torch.cuda.memory_allocated() / 1e6
                         modelCS.to("cpu")
                         while torch.cuda.memory_allocated() / 1e6 >= mem:
                             time.sleep(1)
 
+                    # encode (scaled latent)
+                    z_enc = model.stochastic_encode(
+                        init_latent, torch.tensor([t_enc] * batch_size).to(device), seed, ddim_eta, ddim_steps
+                    )
+                    # decode it
                     samples_ddim = model.sample(
-                        S=ddim_steps,
-                        conditioning=c,
-                        seed=seed,
-                        shape=shape,
-                        verbose=False,
-                        unconditional_guidance_scale=scale,
-                        unconditional_conditioning=uc,
-                        eta=ddim_eta,
-                        x_T=start_code,
-                        sampler = sampler,
+                                    t_enc,
+                                    c,
+                                    z_enc,
+                                    unconditional_guidance_scale=scale,
+                                    unconditional_conditioning=uc,
+                                    sampler = sampler
                     )
 
                     modelFS.to(device)
@@ -217,7 +249,7 @@ def generate(
     txt = (
         "Samples finished in "
         + str(round(time_taken, 3))
-        + " minutes and exported to "
+        + " minutes and exported to \n"
         + sample_path
         + "\nSeeds used = "
         + seeds[:-1]
@@ -228,7 +260,9 @@ def generate(
 demo = gr.Interface(
     fn=generate,
     inputs=[
+        gr.Image(tool="editor", type="pil"),
         "text",
+        gr.Slider(0, 1, value=0.75),
         gr.Slider(1, 1000, value=50),
         gr.Slider(1, 100, step=1),
         gr.Slider(1, 100, step=1),
@@ -239,11 +273,10 @@ demo = gr.Interface(
         gr.Slider(1, 2, value=1, step=1),
         gr.Text(value="cuda"),
         "text",
-        gr.Text(value="outputs/txt2img-samples"),
+        gr.Text(value="outputs/img2img-samples"),
         gr.Radio(["png", "jpg"], value='png'),
         "checkbox",
         "checkbox",
-        gr.Radio(["ddim", "plms","heun", "euler", "euler_a", "dpm2", "dpm2_a", "lms"], value="plms"),
     ],
     outputs=["image", "text"],
 )
