@@ -5,15 +5,11 @@ https://github.com/openai/improved-diffusion/blob/e94489283bb876ac1477d5dd7709bb
 https://github.com/CompVis/taming-transformers
 -- merci
 """
-
-import time, math
+import time
 from tqdm.auto import trange, tqdm
 import torch
-from einops import rearrange
 from tqdm import tqdm
 from diffusion.distributions import DiagonalGaussianDistribution
-from diffusion.autoencoder import VQModelInterface
-import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
 from functools import partial
@@ -39,7 +35,6 @@ class DDPM(pl.LightningModule):
                  ignore_keys=[],
                  load_only_unet=False,
                  monitor="val/loss",
-                 use_ema=True,
                  first_stage_key="image",
                  image_size=256,
                  channels=3,
@@ -52,7 +47,6 @@ class DDPM(pl.LightningModule):
                  original_elbo_weight=0.,
                  v_posterior=0.,  # weight for choosing posterior variance as sigma = (1-v) * beta_tilde + v * beta
                  l_simple_weight=1.,
-                 conditioning_key=None,
                  parameterization="eps",  # all assuming fixed variance schedules
                  scheduler_config=None,
                  use_positional_encodings=False,
@@ -65,7 +59,7 @@ class DDPM(pl.LightningModule):
         self.clip_denoised = clip_denoised
         self.log_every_t = log_every_t
         self.first_stage_key = first_stage_key
-        self.image_size = image_size  # try conv?
+        self.image_size = image_size
         self.channels = channels
         self.use_positional_encodings = use_positional_encodings
         self.use_scheduler = scheduler_config is not None
@@ -106,46 +100,19 @@ class DDPM(pl.LightningModule):
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
 
 
-class FirstStage(DDPM):
+class FirstStage(pl.LightningModule):
     """main class"""
     def __init__(self,
                  first_stage_config,
-                 num_timesteps_cond=None,
-                 cond_stage_key="image",
-                 cond_stage_trainable=False,
-                 concat_mode=True,
                  cond_stage_forward=None,
-                 conditioning_key=None,
                  scale_factor=1.0,
-                 scale_by_std=False,
-                 *args, **kwargs):
-        self.num_timesteps_cond = default(num_timesteps_cond, 1)
+                 scale_by_std=False):
         self.scale_by_std = scale_by_std
-        assert self.num_timesteps_cond <= kwargs['timesteps']
-        # for backwards compatibility after implementation of DiffusionWrapper
-        if conditioning_key is None:
-            conditioning_key = 'concat' if concat_mode else 'crossattn'
-        ckpt_path = kwargs.pop("ckpt_path", None)
-        ignore_keys = kwargs.pop("ignore_keys", [])
         super().__init__()
-        self.concat_mode = concat_mode
-        self.cond_stage_trainable = cond_stage_trainable
-        self.cond_stage_key = cond_stage_key
-        try:
-            self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
-        except:
-            self.num_downs = 0
         if not scale_by_std:
             self.scale_factor = scale_factor
         self.instantiate_first_stage(first_stage_config)
         self.cond_stage_forward = cond_stage_forward
-        self.clip_denoised = False
-        self.bbox_tokenizer = None  
-
-        self.restarted_from_ckpt = False
-        if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys)
-            self.restarted_from_ckpt = True
 
 
     def instantiate_first_stage(self, config):
@@ -160,148 +127,40 @@ class FirstStage(DDPM):
             z = encoder_posterior.sample()
         elif isinstance(encoder_posterior, torch.Tensor):
             z = encoder_posterior
-        else:
-            raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
         return self.scale_factor * z
 
 
     @torch.no_grad()
-    def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
-        if predict_cids:
-            if z.dim() == 4:
-                z = torch.argmax(z.exp(), dim=1).long()
-            z = self.first_stage_model.quantize.get_codebook_entry(z, shape=None)
-            z = rearrange(z, 'b h w c -> b c h w').contiguous()
+    def decode_first_stage(self, z):
 
         z = 1. / self.scale_factor * z
-
-        if hasattr(self, "split_input_params"):
-            if isinstance(self.first_stage_model, VQModelInterface):
-                return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
-            else:
-                return self.first_stage_model.decode(z)
-
-        else:
-            if isinstance(self.first_stage_model, VQModelInterface):
-                return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
-            else:
-                return self.first_stage_model.decode(z)
+        return self.first_stage_model.decode(z)
 
 
     @torch.no_grad()
     def encode_first_stage(self, x):
-        if hasattr(self, "split_input_params"):
-            if self.split_input_params["patch_distributed_vq"]:
-                ks = self.split_input_params["ks"]  # eg. (128, 128)
-                stride = self.split_input_params["stride"]  # eg. (64, 64)
-                df = self.split_input_params["vqf"]
-                self.split_input_params['original_image_size'] = x.shape[-2:]
-                bs, nc, h, w = x.shape
-                if ks[0] > h or ks[1] > w:
-                    ks = (min(ks[0], h), min(ks[1], w))
-                    print("reducing Kernel")
-
-                if stride[0] > h or stride[1] > w:
-                    stride = (min(stride[0], h), min(stride[1], w))
-                    print("reducing stride")
-
-                fold, unfold, normalization, weighting = self.get_fold_unfold(x, ks, stride, df=df)
-                z = unfold(x)  # (bn, nc * prod(**ks), L)
-                # Reshape to img shape
-                z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
-
-                output_list = [self.first_stage_model.encode(z[:, :, :, :, i])
-                               for i in range(z.shape[-1])]
-
-                o = torch.stack(output_list, axis=-1)
-                o = o * weighting
-
-                # Reverse reshape to img shape
-                o = o.view((o.shape[0], -1, o.shape[-1]))  # (bn, nc * ks[0] * ks[1], L)
-                # stitch crops together
-                decoded = fold(o)
-                decoded = decoded / normalization
-                return decoded
-
-            else:
-                return self.first_stage_model.encode(x)
-        else:
-            return self.first_stage_model.encode(x)
+        return self.first_stage_model.encode(x)
 
 
-class CondStage(DDPM):
-    """main class"""
+class CondStage(pl.LightningModule):
     def __init__(self,
                  cond_stage_config,
-                 num_timesteps_cond=None,
-                 cond_stage_key="image",
-                 cond_stage_trainable=False,
-                 concat_mode=True,
-                 cond_stage_forward=None,
-                 conditioning_key=None,
-                 scale_factor=1.0,
-                 scale_by_std=False,
-                 *args, **kwargs):
-        self.num_timesteps_cond = default(num_timesteps_cond, 1)
-        self.scale_by_std = scale_by_std
-        assert self.num_timesteps_cond <= kwargs['timesteps']
-        # for backwards compatibility after implementation of DiffusionWrapper
-        if conditioning_key is None:
-            conditioning_key = 'concat' if concat_mode else 'crossattn'
-        if cond_stage_config == '__is_unconditional__':
-            conditioning_key = None
-        ckpt_path = kwargs.pop("ckpt_path", None)
-        ignore_keys = kwargs.pop("ignore_keys", [])
+                 cond_stage_forward=None):
         super().__init__()
-        self.concat_mode = concat_mode
-        self.cond_stage_trainable = cond_stage_trainable
-        self.cond_stage_key = cond_stage_key
-        self.num_downs = 0
-        if not scale_by_std:
-            self.scale_factor = scale_factor
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
-        self.clip_denoised = False
-        self.bbox_tokenizer = None  
-
-        self.restarted_from_ckpt = False
-        if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys)
-            self.restarted_from_ckpt = True
 
     def instantiate_cond_stage(self, config):
-        if not self.cond_stage_trainable:
-            if config == "__is_first_stage__":
-                print("Using first stage also as cond stage.")
-                self.cond_stage_model = self.first_stage_model
-            elif config == "__is_unconditional__":
-                print(f"Training {self.__class__.__name__} as an unconditional model.")
-                self.cond_stage_model = None
-                # self.be_unconditional = True
-            else:
-                model = instantiate_from_config(config)
-                self.cond_stage_model = model.eval()
-                self.cond_stage_model.train = disabled_train
-                for param in self.cond_stage_model.parameters():
-                    param.requires_grad = False
-        else:
-            assert config != '__is_first_stage__'
-            assert config != '__is_unconditional__'
             model = instantiate_from_config(config)
-            self.cond_stage_model = model
+            self.cond_stage_model = model.eval()
+            self.cond_stage_model.train = disabled_train
+            for param in self.cond_stage_model.parameters():
+                param.requires_grad = False
+
 
     def get_learned_conditioning(self, c):
-        if self.cond_stage_forward is None:
-            if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
-                c = self.cond_stage_model.encode(c)
-                if isinstance(c, DiagonalGaussianDistribution):
-                    c = c.mode()
-            else:
-                c = self.cond_stage_model(c)
-        else:
-            assert hasattr(self.cond_stage_model, self.cond_stage_forward)
-            c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
-        return c
+        return self.cond_stage_model(c)
+        
 
 class DiffusionWrapper(pl.LightningModule):
     def __init__(self, diff_model_config):
@@ -317,8 +176,8 @@ class DiffusionWrapperOut(pl.LightningModule):
         super().__init__()
         self.diffusion_model = instantiate_from_config(diff_model_config)
 
-    def forward(self, h,emb,tp,hs, cc):
-        return self.diffusion_model(h,emb,tp,hs, context=cc)
+    def forward(self, h,emb,hs, cc, tp=None):
+        return self.diffusion_model(h,emb,hs, cc, tp)
 
 
 class UNet(DDPM):
@@ -329,23 +188,12 @@ class UNet(DDPM):
                  num_timesteps_cond=None,
                  cond_stage_key="image",
                  cond_stage_trainable=False,
-                 concat_mode=True,
                  cond_stage_forward=None,
-                 conditioning_key=None,
                  scale_factor=1.0,
                  unet_bs = 1,
-                 scale_by_std=False,
-                 *args, **kwargs):
+                 scale_by_std=False):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
-        assert self.num_timesteps_cond <= kwargs['timesteps']
-        # for backwards compatibility after implementation of DiffusionWrapper
-        if conditioning_key is None:
-            conditioning_key = 'concat' if concat_mode else 'crossattn'
-        ckpt_path = kwargs.pop("ckpt_path", None)
-        ignore_keys = kwargs.pop("ignore_keys", [])
-        super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
-        self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
         self.num_downs = 0
@@ -359,76 +207,51 @@ class UNet(DDPM):
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None  
-        self.model1 = DiffusionWrapper(self.unetConfigEncode)
-        self.model2 = DiffusionWrapperOut(self.unetConfigDecode)
-        self.model1.eval()
-        self.model2.eval()
+        super().__init__()
+        self.model1 = None
+        self.model2 = None
         self.turbo = False
         self.unet_bs = unet_bs
-        self.restarted_from_ckpt = False
-        if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys)
-            self.restarted_from_ckpt = True
 
-    def make_cond_schedule(self, ):
+    def make_cond_schedule(self):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
         ids = torch.round(torch.linspace(0, self.num_timesteps - 1, self.num_timesteps_cond)).long()
         self.cond_ids[:self.num_timesteps_cond] = ids
 
-    @rank_zero_only
-    @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx):
-        # only for very first batch
-        if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
-            assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
-            # set rescale weight to 1./std of encodings
-            print("### USING STD-RESCALING ###")
-            x = super().get_input(batch, self.first_stage_key)
-            x = x.to(self.cdevice)
-            encoder_posterior = self.encode_first_stage(x)
-            z = self.get_first_stage_encoding(encoder_posterior).detach()
-            del self.scale_factor
-            self.register_buffer('scale_factor', 1. / z.flatten().std())
-            print(f"setting self.scale_factor to {self.scale_factor}")
-            print("### USING STD-RESCALING ###")
-
-
     def apply_model(self, x_noisy, t, cond, return_ids=False):
           
-        if(not self.turbo):
-            self.model1.to(self.cdevice)
+        with torch.jit.optimized_execution(False):
+            if(not self.turbo):
+                self.model1.to(self.cdevice)
 
-        step = self.unet_bs
-        h,emb,hs = self.model1(x_noisy[0:step], t[:step], cond[:step])
-        bs = cond.shape[0]
-        
-        # assert bs%2 == 0
-        lenhs = len(hs)
+            step = self.unet_bs
+            h,emb,hs = self.model1(x_noisy[0:step], t[:step], cond[:step])
+            bs = cond.shape[0]
+            
+            # assert bs%2 == 0
+            lenhs = len(hs)
 
-        for i in range(step,bs,step):
-            h_temp,emb_temp,hs_temp = self.model1(x_noisy[i:i+step], t[i:i+step], cond[i:i+step])
-            h = torch.cat((h,h_temp))
-            emb = torch.cat((emb,emb_temp))
-            for j in range(lenhs):
-                hs[j] = torch.cat((hs[j], hs_temp[j]))
-        
+            for i in range(step,bs,step):
+                h_temp,emb_temp,hs_temp = self.model1(x_noisy[i:i+step], t[i:i+step], cond[i:i+step])
+                h = torch.cat((h,h_temp))
+                emb = torch.cat((emb,emb_temp))
+                for j in range(lenhs):
+                    hs[j] = torch.cat((hs[j], hs_temp[j]))
+            
 
-        if(not self.turbo):
-            self.model1.to("cpu")
-            self.model2.to(self.cdevice)
-        
-        hs_temp = [hs[j][:step] for j in range(lenhs)]
-        x_recon = self.model2(h[:step],emb[:step],x_noisy.dtype,hs_temp,cond[:step])
+            if(not self.turbo):
+                self.model1.to("cpu")
+                self.model2.to(self.cdevice)
+            
+            hs_temp = [hs[j][:step] for j in range(lenhs)]
+            x_recon = self.model2(h[:step],emb[:step],hs_temp,cond[:step])
+            for i in range(step,bs,step):
 
-        for i in range(step,bs,step):
-
-            hs_temp = [hs[j][i:i+step] for j in range(lenhs)]
-            x_recon1 = self.model2(h[i:i+step],emb[i:i+step],x_noisy.dtype,hs_temp,cond[i:i+step])
-            x_recon = torch.cat((x_recon, x_recon1))
-
-        if(not self.turbo):
-            self.model2.to("cpu")
-
+                hs_temp = [hs[j][i:i+step] for j in range(lenhs)]
+                x_recon1 = self.model2(h[i:i+step],emb[i:i+step],hs_temp,cond[i:i+step])
+                x_recon = torch.cat((x_recon, x_recon1))
+            if(not self.turbo):
+                self.model2.to("cpu")
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
         else:
@@ -440,11 +263,11 @@ class UNet(DDPM):
                     attr = attr.to(torch.device(self.cdevice))
             setattr(self, name, attr)
 
-    def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
+    def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0):
 
 
         self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
-                                                  num_ddpm_timesteps=self.num_timesteps,verbose=verbose)
+                                                  num_ddpm_timesteps=self.num_timesteps)
 
         
         assert self.alphas_cumprod.shape[0] == self.num_timesteps, 'alphas have to be defined for each timestep'
@@ -456,7 +279,7 @@ class UNet(DDPM):
         # ddim sampling parameters
         ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(alphacums=self.alphas_cumprod.cpu(),
                                                                                    ddim_timesteps=self.ddim_timesteps,
-                                                                                   eta=ddim_eta,verbose=verbose)
+                                                                                   eta=ddim_eta)
         self.register_buffer1('ddim_sigmas', ddim_sigmas)
         self.register_buffer1('ddim_alphas', ddim_alphas)
         self.register_buffer1('ddim_alphas_prev', ddim_alphas_prev)
@@ -480,7 +303,6 @@ class UNet(DDPM):
                noise_dropout=0.,
                score_corrector=None,
                corrector_kwargs=None,
-               verbose=True,
                x_T=None,
                log_every_t=100,
                unconditional_guidance_scale=1.,
@@ -506,9 +328,9 @@ class UNet(DDPM):
 
         x_latent = noise if x0 is None else x0
         # sampling
+        self.make_schedule(ddim_num_steps=S, ddim_eta=eta)
         
         if sampler == "plms":
-            self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
             print(f'Data shape for PLMS sampling is {shape}')
             samples = self.plms_sampling(conditioning, batch_size, x_latent,
                                         callback=callback,
@@ -531,11 +353,9 @@ class UNet(DDPM):
                                          mask = mask,init_latent=x_T,use_original_steps=False)
 
         elif sampler == "euler":
-            self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
             samples = self.euler_sampling(self.alphas_cumprod,x_latent, S, conditioning, unconditional_conditioning=unconditional_conditioning,
                                         unconditional_guidance_scale=unconditional_guidance_scale)
         elif sampler == "euler_a":
-            self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
             samples = self.euler_ancestral_sampling(self.alphas_cumprod,x_latent, S, conditioning, unconditional_conditioning=unconditional_conditioning,
                                         unconditional_guidance_scale=unconditional_guidance_scale)
 
@@ -675,7 +495,7 @@ class UNet(DDPM):
     def stochastic_encode(self, x0, t, seed, ddim_eta,ddim_steps,use_original_steps=False, noise=None):
         # fast, but does not allow for exact reconstruction
         # t serves as an index to gather the correct alphas
-        self.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=ddim_eta, verbose=False)
+        self.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=ddim_eta)
         sqrt_alphas_cumprod = torch.sqrt(self.ddim_alphas)
 
         if noise is None:
@@ -698,8 +518,6 @@ class UNet(DDPM):
         sqrt_alphas_cumprod = torch.sqrt(self.ddim_alphas)
         noise = torch.randn(x0.shape, device=x0.device)
 
-        # print(extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape),
-        #       extract_into_tensor(self.ddim_sqrt_one_minus_alphas, t, x0.shape))
         return (extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape) * x0 +
                 extract_into_tensor(self.ddim_sqrt_one_minus_alphas, t, x0.shape) * noise)
 
@@ -745,6 +563,7 @@ class UNet(DDPM):
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             e_t = self.apply_model(x, t, c)
         else:
+            
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
             c_in = torch.cat([unconditional_conditioning, c])

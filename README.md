@@ -39,7 +39,7 @@ This will launch gradio on port 7860 with txt2img. You can also use `docker comp
 
 ## txt2img
 
-- `txt2img` can generate _512x512 images from a prompt using under 2.4GB GPU VRAM in under 24 seconds per image_ on an RTX 2060.
+- `txt2img` can generate _512x512 images from a prompt using under 1.2GB GPU VRAM in under 24 seconds per image_ on an RTX 2060.
 
 - For example, the following command will generate 10 512x512 images:
 

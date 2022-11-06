@@ -5,32 +5,19 @@ from random import randint
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
-from itertools import islice
 from einops import rearrange
-from torchvision.utils import make_grid
 import time
 from pytorch_lightning import seed_everything
 from torch import autocast
-from contextlib import contextmanager, nullcontext
-from diffusion.util import instantiate_from_config
+from contextlib import  nullcontext
+from diffusion import ddpm
+from diffusion.util import instantiate_from_config, chunk
 from diffusion.util import split_weighted_subprompts, logger
 from transformers import logging
 # from samplers import CompVisDenoiser
 logging.set_verbosity_error()
 
-
-def chunk(it, size):
-    it = iter(it)
-    return iter(lambda: tuple(islice(it, size)), ())
-
-
-def load_model_from_config(ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
-    return sd
+# torch.cuda.set_per_process_memory_fraction(0.3)
 
 
 config = "diffusion/v1-inference.yaml"
@@ -173,6 +160,12 @@ parser.add_argument(
     help="path to checkpoint of model",
     default=DEFAULT_CKPT,
 )
+parser.add_argument(
+    "--jit",
+    action="store_true",
+    help="Uses the JIT compiled model for faster loading and inference",
+)
+
 opt = parser.parse_args()
 
 tic = time.time()
@@ -187,46 +180,77 @@ seed_everything(opt.seed)
 # Logging
 logger(vars(opt), log_csv = "logs/txt2img_logs.csv")
 
-sd = load_model_from_config(f"{opt.ckpt}")
-li, lo = [], []
-for key, value in sd.items():
-    sp = key.split(".")
-    if (sp[0]) == "model":
-        if "input_blocks" in sp:
-            li.append(key)
-        elif "middle_block" in sp:
-            li.append(key)
-        elif "time_embed" in sp:
-            li.append(key)
-        else:
-            lo.append(key)
-for key in li:
-    sd["model1." + key[6:]] = sd.pop(key)
-for key in lo:
-    sd["model2." + key[6:]] = sd.pop(key)
-
+## Loading model
 config = OmegaConf.load(f"{config}")
+t = time.time()
+modelFS = instantiate_from_config(config.modelFirstStage)
+modelFSsd  = torch.load("split_model/modelFS1.4_fp16.pth")
+_, _ = modelFS.load_state_dict(modelFSsd['state_dict'], strict=False)
+modelFS.eval()
 
 model = instantiate_from_config(config.modelUNet)
-_, _ = model.load_state_dict(sd, strict=False)
+model.jit = opt.jit
+
+if opt.precision == "autocast" and opt.device == "cuda":
+    if not opt.jit:
+        modelsd  = torch.load("split_model/model1.4_fp16.pth")
+        model.model1 = ddpm.DiffusionWrapper(model.unetConfigEncode)
+        model.model2 = ddpm.DiffusionWrapperOut(model.unetConfigDecode)
+        _, _ = model.load_state_dict(modelsd['state_dict'] , strict=False)
+
+    else:
+        modelsd  = torch.load("split_model/model1.4_fp16_betas.pth")
+        _, _ = model.load_state_dict(modelsd['state_dict'] , strict=False)
+        model.model1  = torch.jit.load("split_model/model1_traced_cuda_fp16.pth")
+        model.model2 = torch.jit.load("split_model/model2_traced_cuda_fp16.pth")
+
+else:
+    if not opt.jit:
+        modelsd  = torch.load("split_model/model1.4_fp32.pth")
+        model.model1 = ddpm.DiffusionWrapper(model.unetConfigEncode)
+        model.model2 = ddpm.DiffusionWrapperOut(model.unetConfigDecode)
+        _, _ = model.load_state_dict(modelsd['state_dict'] , strict=False)
+
+    else:
+        modelsd  = torch.load("split_model/model1.4_fp32_betas.pth")
+        _, _ = model.load_state_dict(modelsd['state_dict'] , strict=False)
+        if opt.device != 'cpu':
+            model.model1  = torch.jit.load("split_model/model1_traced_cuda_fp32.pth")
+            model.model2 = torch.jit.load("split_model/model2_traced_cuda_fp32.pth")
+
+        else:
+            model.model1  = torch.jit.load("split_model/model1_traced_cpu_fp32.pth")
+            model.model2 = torch.jit.load("split_model/model2_traced_cpu_fp32.pth")
+
+model.model1.eval()
+model.model2.eval()
 model.eval()
+
 model.unet_bs = opt.unet_bs
 model.cdevice = opt.device
 model.turbo = opt.turbo
+model.model2.to("cpu")
+model.model1.to("cpu")
 
 modelCS = instantiate_from_config(config.modelCondStage)
-_, _ = modelCS.load_state_dict(sd, strict=False)
+modelCSsd  = torch.load("split_model/modelCS1.4_fp16.pth")
+_, _ = modelCS.load_state_dict(modelCSsd['state_dict'], strict=False)
 modelCS.eval()
 modelCS.cond_stage_model.device = opt.device
 
-modelFS = instantiate_from_config(config.modelFirstStage)
-_, _ = modelFS.load_state_dict(sd, strict=False)
-modelFS.eval()
-del sd
+del modelCSsd
+del modelFSsd
+del modelsd
+
+print("Model loaded in ", time.time() - t, " sec")
+## Model Loaded
 
 if opt.device != "cpu" and opt.precision == "autocast":
     model.half()
+    # modelFS.half()
     modelCS.half()
+    model.model2.half()
+    model.model1.half()
 
 start_code = None
 if opt.fixed_code:
@@ -301,7 +325,6 @@ with torch.no_grad():
                     conditioning=c,
                     seed=opt.seed,
                     shape=shape,
-                    verbose=False,
                     unconditional_guidance_scale=opt.scale,
                     unconditional_conditioning=uc,
                     eta=opt.ddim_eta,
@@ -313,6 +336,7 @@ with torch.no_grad():
 
                 print(samples_ddim.shape)
                 print("saving images")
+                
                 for i in range(batch_size):
 
                     x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
@@ -334,9 +358,8 @@ with torch.no_grad():
                 print("memory_final = ", torch.cuda.memory_allocated() / 1e6)
 
 toc = time.time()
-
 time_taken = (toc - tic) / 60.0
-
+print("max_memory = ", torch.cuda.max_memory_allocated()/1e6)
 print(
     (
         "Samples finished in {0:.2f} minutes and exported to "

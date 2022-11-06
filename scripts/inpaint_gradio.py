@@ -5,7 +5,6 @@ import time
 from contextlib import nullcontext
 from itertools import islice
 from random import randint
-
 import gradio as gr
 import numpy as np
 import torch
@@ -17,9 +16,7 @@ from torch import autocast
 from torchvision.utils import make_grid
 from tqdm import tqdm, trange
 from transformers import logging
-
-from ldm.util import instantiate_from_config
-from optimUtils import split_weighted_subprompts, logger
+from diffusion.util import instantiate_from_config, split_weighted_subprompts, logger
 
 logging.set_verbosity_error()
 import mimetypes

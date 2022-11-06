@@ -5,22 +5,20 @@ from torchvision.utils import make_grid
 from einops import rearrange
 import os, re
 from PIL import Image
+from omegaconf import OmegaConf
+from diffusion import ddpm
 import torch
-import pandas as pd
 import numpy as np
 from random import randint
-from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
-from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
 import time
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
-from diffusion.util import instantiate_from_config
-from util import split_weighted_subprompts, logger
+from diffusion.util import instantiate_from_config, split_weighted_subprompts, logger
 from transformers import logging
 logging.set_verbosity_error()
 import mimetypes
@@ -28,54 +26,49 @@ mimetypes.init()
 mimetypes.add_type("application/javascript", ".js")
 
 
-def chunk(it, size):
-    it = iter(it)
-    return iter(lambda: tuple(islice(it, size)), ())
-
-
-def load_model_from_config(ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
-    return sd
-
 config = "diffusion/v1-inference.yaml"
-ckpt = "models/diffusion/stable-diffusion-v1/model.ckpt"
-sd = load_model_from_config(f"{ckpt}")
-li, lo = [], []
-for key, v_ in sd.items():
-    sp = key.split(".")
-    if (sp[0]) == "model":
-        if "input_blocks" in sp:
-            li.append(key)
-        elif "middle_block" in sp:
-            li.append(key)
-        elif "time_embed" in sp:
-            li.append(key)
-        else:
-            lo.append(key)
-for key in li:
-    sd["model1." + key[6:]] = sd.pop(key)
-for key in lo:
-    sd["model2." + key[6:]] = sd.pop(key)
-
 config = OmegaConf.load(f"{config}")
 
+t = time.time()
+modelFS = instantiate_from_config(config.modelFirstStage)
+modelFSsd  = torch.load("split_model/modelFS1.4_fp16.pth")
+_, _ = modelFS.load_state_dict(modelFSsd['state_dict'], strict=False)
+modelFS.eval()
 model = instantiate_from_config(config.modelUNet)
-_, _ = model.load_state_dict(sd, strict=False)
+
+jit = True
+model.jit = jit
+if not jit:
+    modelsd  = torch.load("split_model/model1.4_fp16.pth")
+    model.model1 = ddpm.DiffusionWrapper(model.unetConfigEncode)
+    model.model2 = ddpm.DiffusionWrapperOut(model.unetConfigDecode)
+    _, _ = model.load_state_dict(modelsd['state_dict'] , strict=False)
+
+else:
+    modelsd  = torch.load("split_model/model1.4_fp16_betas.pth")
+    _, _ = model.load_state_dict(modelsd['state_dict'] , strict=False)
+    if torch.cuda.is_available():
+        model.model1  = torch.jit.load("split_model/model1_traced.pth")
+        model.model2 = torch.jit.load("split_model/model2_traced.pth")
+    else:
+        model.model1  = torch.jit.load("split_model/model1_traced_cpu.pth")
+        model.model2 = torch.jit.load("split_model/model2_traced_cpu.pth")
+
+
+model.model1.eval()
+model.model2.eval()
 model.eval()
+model.model2.to("cpu")
+model.model1.to("cpu")
 
 modelCS = instantiate_from_config(config.modelCondStage)
-_, _ = modelCS.load_state_dict(sd, strict=False)
+modelCSsd  = torch.load("split_model/modelCS1.4_fp16.pth")
+_, _ = modelCS.load_state_dict(modelCSsd['state_dict'], strict=False)
 modelCS.eval()
 
-modelFS = instantiate_from_config(config.modelFirstStage)
-_, _ = modelFS.load_state_dict(sd, strict=False)
-modelFS.eval()
-del sd
-
+del modelCSsd
+del modelFSsd
+del modelsd
 
 def generate(
     prompt,
@@ -112,7 +105,8 @@ def generate(
     logger(locals(), "logs/txt2img_gradio_logs.csv")
 
     if device != "cpu" and full_precision == False:
-        model.half()
+        model.model2.half()
+        model.model1.half()
         modelFS.half()
         modelCS.half()
 
@@ -173,7 +167,6 @@ def generate(
                         conditioning=c,
                         seed=seed,
                         shape=shape,
-                        verbose=False,
                         unconditional_guidance_scale=scale,
                         unconditional_conditioning=uc,
                         eta=ddim_eta,
